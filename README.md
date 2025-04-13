@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # CoViS-Net
 
 [![GitHub license](https://img.shields.io/badge/license-GPLv3.0-blue.svg)](https://github.com/proroklab/CoViS-Net/blob/master/LICENSE)
@@ -73,3 +74,6 @@ python -m evaluation.run_decentralized
 ```
 from the root of the repository to evaluate some selected images from the real-world dataset.
 >>>>>>> a87411e (Point to new repo)
+=======
+# Int8-CovisNet
+>>>>>>> b1407fd (Initial commit)
