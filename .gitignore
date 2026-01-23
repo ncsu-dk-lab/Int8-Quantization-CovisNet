@@ -1,0 +1,9 @@
+# generated / model artifacts
+models/
+calib/
+*.onnx
+*.npz
+*.ckpt
+*.pkl
+*.ts
+*.engine
