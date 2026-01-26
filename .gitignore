@@ -1,5 +1,11 @@
 # generated / model artifacts
 models/
+*.onnx
+*.npz
+*.ckpt
+*.pkl
+*.ts
+*.engine
 calib/
 *.onnx
 *.npz
