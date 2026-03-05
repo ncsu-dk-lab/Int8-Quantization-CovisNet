@@ -6,52 +6,63 @@ from .utils import radius_graph
 from torch_geometric.utils import dropout_edge
 import torch_geometric
 import roma
-import torch_scatter
 from evaluation.utils import evaluate_model_accruacy
-import torch_tensorrt
-from typing import Dict
-from torch import Tensor
+
+
 
 
 from torch.utils.data import IterableDataset, DataLoader
 # ---------- Generic TensorRT engine runner (FP16-friendly) ----------
 
+import os
+import torch
+import tensorrt as trt
+
 class TRTEngine:
     def __init__(self, engine_path: str):
         assert os.path.exists(engine_path), f"Engine not found: {engine_path}"
-        logger = trt.Logger(trt.Logger.VERBOSE)
-        with open(engine_path, "rb") as f, trt.Runtime(logger) as runtime:
+        
+        # Initialize TRT logger and runtime
+        self.logger = trt.Logger(trt.Logger.VERBOSE)
+        trt.init_libnvinfer_plugins(self.logger, "") # Good practice if your model uses TRT plugins
+
+        with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
             self.engine: trt.ICudaEngine = runtime.deserialize_cuda_engine(f.read())
 
-        self.context: trt.IExecutionContext = self.engine.create_execution_context()
+        if self.engine is None:
+            raise RuntimeError(f"Failed to deserialize engine from {engine_path}")
 
-        # Torch CUDA stream handle (int) for execute_async_v3
-        self.stream = torch.cuda.current_stream().cuda_stream
+        self.context: trt.IExecutionContext = self.engine.create_execution_context()
 
         # Cache I/O tensor names (TRT-10 tensor API)
         n_io = self.engine.num_io_tensors
         self.tensor_names = [self.engine.get_tensor_name(i) for i in range(n_io)]
-        self.input_names  = [n for n in self.tensor_names
+        self.input_names  = [n for n in self.tensor_names 
                              if self.engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT]
-        self.output_names = [n for n in self.tensor_names
+        self.output_names = [n for n in self.tensor_names 
                              if self.engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT]
 
+    def __del__(self):
+        """Safely clean up C++ TensorRT bindings to prevent GPU memory leaks."""
+        if hasattr(self, 'context') and self.context is not None:
+            del self.context
+        if hasattr(self, 'engine') and self.engine is not None:
+            del self.engine
+
     # --- utils ---
-    def _torch_dtype_from_trt(self, t: trt.DataType):
+    def _torch_dtype_from_trt(self, t: trt.DataType) -> torch.dtype:
         if t == trt.DataType.HALF:  return torch.float16
         if t == trt.DataType.FLOAT: return torch.float32
         if t == trt.DataType.INT32: return torch.int32
         if t == trt.DataType.INT8:  return torch.int8
         if t == trt.DataType.BOOL:  return torch.bool
+        # Added INT64 as it is common for indices/argmax outputs
+        if t == trt.DataType.INT64: return torch.int64 
         raise ValueError(f"Unsupported TRT dtype: {t}")
 
     def __call__(self, profile_index: int = 0, **tensors):
         """
-        Run inference on the TensorRT engine using the Tensor API (TRT 8+/10).
-
-        Usage:
-            outputs = engine(image=img_tensor)
-            # where "image" matches the real TRT input tensor name
+        Run inference on the TensorRT engine using the Tensor API (TRT 10).
         """
         if not tensors:
             raise ValueError("No input tensors provided to TRTEngine.__call__")
@@ -60,38 +71,15 @@ class TRTEngine:
         first_in = next(iter(tensors.values()))
         if not first_in.is_cuda:
             raise AssertionError(f"All inputs must be CUDA tensors; got {first_in.device}")
+        
         device = first_in.device
-        # Use the *current* PyTorch stream on that device
         stream = torch.cuda.current_stream(device).cuda_stream
 
-        # --- 0) Select optimization profile BEFORE shapes/addresses ---
-        set_prof_async = getattr(self.context, "set_optimization_profile_async", None)
-        if set_prof_async is not None:
-            ok = set_prof_async(profile_index, stream)
-            if not ok:
-                raise RuntimeError(f"set_optimization_profile_async({profile_index}) failed")
-        else:
-            set_prof = getattr(self.context, "set_optimization_profile", None)
-            if set_prof is None:
-                raise RuntimeError("ExecutionContext has no optimization profile API")
-            ok = set_prof(profile_index)
-            if not ok:
-                raise RuntimeError(f"set_optimization_profile({profile_index}) failed")
-
         # --- 1) Get profile bounds, validate input shapes & set shapes ---
-        profile_bounds = {}
-        for name in self.input_names:
-            mn, opt, mx = self.engine.get_tensor_profile_shape(name, profile_index)
-            profile_bounds[name] = (tuple(mn), tuple(opt), tuple(mx))
-            # You can uncomment for debugging:
-            # print(f"[TRT] {name}: min={mn}, opt={opt}, max={mx}")
-
-        # Validate inputs and set shapes in the context
         for name in self.input_names:
             if name not in tensors:
                 raise KeyError(
-                    f"Missing required input: '{name}'. "
-                    f"Available inputs: {self.input_names}"
+                    f"Missing required input: '{name}'. Available inputs: {self.input_names}"
                 )
 
             t = tensors[name]
@@ -99,12 +87,14 @@ class TRTEngine:
                 raise AssertionError(f"Input '{name}' must be CUDA, got device={t.device}")
 
             # Cast FP32->FP16 if engine expects HALF and user gave FLOAT
-            if self.engine.get_tensor_dtype(name) == trt.DataType.HALF and t.dtype == torch.float32:
+            expected_dtype = self.engine.get_tensor_dtype(name)
+            if expected_dtype == trt.DataType.HALF and t.dtype == torch.float32:
                 t = t.to(torch.float16)
                 tensors[name] = t
 
+            # Retrieve profile bounds for dynamic shapes
+            mn, opt, mx = self.engine.get_tensor_profile_shape(name, profile_index)
             shp = tuple(int(x) for x in t.shape)
-            mn, _, mx = profile_bounds[name]
 
             # Rank / bounds checks
             if len(shp) != len(mx):
@@ -117,88 +107,48 @@ class TRTEngine:
                         f"Shape {shp} for '{name}' violates profile [{mn}..{mx}]"
                     )
 
-            # Set input shape on the context (tensor API)
-            if hasattr(self.context, "set_input_shape"):
-                ok = self.context.set_input_shape(name, shp)
-            else:
-                ok = self.context.set_tensor_shape(name, shp)
-            if not ok:
+            # Set input shape on the context using TRT 10 API
+            if not self.context.set_input_shape(name, shp):
                 raise RuntimeError(f"set_input_shape failed for '{name}' with shape {shp}")
 
         # --- 2) Sanity check: shapes must now be concrete (no -1) ---
         for name in self.input_names:
             s = tuple(self.context.get_tensor_shape(name))
             if any(d < 0 for d in s):
-                raise RuntimeError(
-                    f"After set_input_shape, '{name}' is still dynamic: {s}. "
-                    f"Check that you used the correct tensor names / API."
-                )
+                raise RuntimeError(f"After set_input_shape, '{name}' is still dynamic: {s}.")
 
         # --- 3) Allocate outputs from context's tensor shapes ---
-        # Use batch dimension from the first input as a fallback for dynamic -1s
-        batch = int(next(iter(tensors.values())).shape[0])
+        outputs = {}
+        batch = int(next(iter(tensors.values())).shape[0]) # Fallback for unresolved dimensions
 
-        def _alloc_out_shape(name: str):
+        for name in self.output_names:
             s = list(self.context.get_tensor_shape(name))
             for i, d in enumerate(s):
-                if d < 0:      # e.g. dynamic batch dimension
-                    s[i] = batch
+                if d < 0:      
+                    s[i] = batch  # Resolve dynamic batch dim
             if any(d <= 0 for d in s):
                 raise RuntimeError(f"Unresolved output shape for '{name}': {s}")
-            return tuple(s)
-
-        outputs = {}
-        for name in self.output_names:
+            
             out_dtype = self._torch_dtype_from_trt(self.engine.get_tensor_dtype(name))
-            outputs[name] = torch.empty(
-                _alloc_out_shape(name),
-                dtype=out_dtype,
-                device=device,
-            )
+            outputs[name] = torch.empty(tuple(s), dtype=out_dtype, device=device)
 
         # --- 4) Register tensor addresses (inputs + outputs) ---
-        # Prefer set_input_tensor_address if available; fall back to set_tensor_address.
-        set_input_addr = getattr(self.context, "set_input_tensor_address", None)
-        if set_input_addr is None:
-            set_input_addr = self.context.set_tensor_address
-
-        # Inputs
         for name in self.input_names:
-            ptr = tensors[name].data_ptr()
-            ok = set_input_addr(name, ptr)
-            if not ok:
+            if not self.context.set_tensor_address(name, tensors[name].data_ptr()):
                 raise RuntimeError(f"Failed to set address for input '{name}'")
 
-        # Outputs
         for name in self.output_names:
-            ptr = outputs[name].data_ptr()
-            ok = self.context.set_tensor_address(name, ptr)
-            if not ok:
+            if not self.context.set_tensor_address(name, outputs[name].data_ptr()):
                 raise RuntimeError(f"Failed to set address for output '{name}'")
 
-        # --- 5) Final guard: shapes must still be concrete before enqueue ---
-        for name in self.input_names:
-            s = tuple(self.context.get_tensor_shape(name))
-            if any(d < 0 for d in s):
-                raise RuntimeError(
-                    f"Input '{name}' still unresolved before enqueue: {s}"
-                )
+        # --- 5) Execute on the chosen CUDA stream ---
+        if not self.context.execute_async_v3(stream):
+            raise RuntimeError("TensorRT execute_async_v3 failed. Check input/output shapes.")
 
-        # --- 6) Execute on the chosen CUDA stream ---
-        ok = self.context.execute_async_v3(stream)
-        if not ok:
-            dbg_inputs = {n: tuple(self.context.get_tensor_shape(n)) for n in self.input_names}
-            dbg_outs   = {n: tuple(self.context.get_tensor_shape(n)) for n in self.output_names}
-            raise RuntimeError(
-                "TensorRT execute_async_v3 failed.\n"
-                f"Resolved input shapes: {dbg_inputs}\n"
-                f"Resolved output shapes: {dbg_outs}\n"
-            )
-
-        # Optional: sync PyTorch with TRT stream to make sure outputs are ready
+        # Sync PyTorch with TRT stream to make sure outputs are ready
         torch.cuda.current_stream(device).synchronize()
 
-        # --- 7) Adjust output views to runtime shapes, if they changed ---
+        # --- 6) Adjust output views to runtime shapes (for data-dependent shapes) ---
         for name in self.output_names:
             rt_shape = tuple(self.context.get_tensor_shape(name))
             if all(d >= 0 for d in rt_shape) and rt_shape != tuple(outputs[name].shape):
@@ -216,11 +166,11 @@ class AssembledBEVGNNTRT(nn.Module):
         bev_gnn_out_channels: int = 384, # expected 384
         dec_out_channels: int = 1,    # expected 1
         engine_dir: str = ".",
-        enc_engine: str = "enc_int8_SmoothQ.engine",
-        msg_engine: str = "msg_int8_SmoothQ.engine",
-        bev_engine: str = "bev_int8_SmoothQ.engine",
-        bevdec_engine: str = "bevdec_int8_SmoothQ.engine",
-        posepost_ts: str = "models/0kc5po4ee18_float32_trt_post.ts",  # TorchScript (TRT-compiled)
+        enc_engine: str = "enc_int8_SmoothQ_512.engine",
+        msg_engine: str = "msg_int8_SmoothQ_512.engine",
+        bev_engine: str = "bev_int8_SmoothQ_512.engine",
+        bevdec_engine: str = "bevdec_int8_SmoothQ_512.engine",
+        posepost_ts: str = "models/0kc5po4ee18_float32_jit_cuda_post.ts",  # TorchScript (TRT-compiled)
         dtype=torch.float32,
     ):
         super().__init__()
@@ -327,11 +277,13 @@ def main():
     dataloader.setup(stage=None)
     test_loader = dataloader.val_dataloader()
 
+    print("Starting evaluation...")
     model = AssembledBEVGNNTRT()
     results = evaluate_model_accruacy(model, test_loader)
     print("!!!!", results)
-
-    # engine = TRTEngine("enc_int8.engine")
+    
+    # print("Starting to load TRT engine...")
+    # engine = TRTEngine("enc_int8_SmoothQ.engine")
     # x = torch.randn(96, 3, 224, 224, device="cuda", dtype=torch.float32)
     # with torch.no_grad():
     #     out = engine(image=x)  # profile_index=0 by default
@@ -339,6 +291,11 @@ def main():
     # print(engine.input_names, engine.output_names)
     # print({k: v.shape for k, v in out.items()})
 
-
+    # FP16: Dist_cm: 45.5711, Angle_deg: 7.2290
+    # FP32: Dist_cm: 45.6932, Angle_deg: 7.1933
+    # Int8_SQ: Dist_cm: 45.1763, Angle_deg: 7.2183
+    # Int8_SQ_512: Dist_cm: 46.6567, Angle_deg: 7.0947
+    # Int8_SQ_200: Dist_cm: 47.1447, Angle_deg: 7.2265
+    # Int8_etp_200: Dist_cm: 103.0701, Angle_deg: 135.2298
 if __name__ == "__main__":
     main()

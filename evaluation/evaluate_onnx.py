@@ -9,6 +9,7 @@ import torch.nn as nn
 import torchvision
 import torch_geometric
 from torch_geometric.utils import dropout_edge, add_self_loops
+from onnxruntime.capi import _pybind_state as C
 from torch.utils.dlpack import to_dlpack, from_dlpack
 from .utils import radius_graph
 
@@ -53,7 +54,7 @@ class OrtModule:
             t = t.contiguous()
 
             # Zero-copy handoff to ORT via DLPack (stays on GPU)
-            feeds[name] = ort.OrtValue.from_dlpack(to_dlpack(t))
+            feeds[name] = C.OrtValue.from_dlpack(to_dlpack(t), False)
 
         # Run and get OrtValue outputs (on GPU)
         ort_outs = self.session.run_with_ort_values(self._output_names, feeds, run_options=None)
@@ -86,11 +87,11 @@ def find_ts_paths(ts_dir: Path):
     return dict(enc=enc, msg=msg, post=post, bev=bev, bev_dec=bev_dec)
 
 def find_onnx_paths(onnx_dir: Path):
-    enc = Path("0kc5po4ee18_int8_max_modelopt_from_onnx_fp16_cuda_enc.onnx")
-    msg = Path("0kc5po4ee18_int8_max_modelopt_from_onnx_fp16_cuda_msg.onnx")
-    post = Path("0kc5po4ee18_float32_jit_cpu_post.ts")
-    bev = Path("0kc5po4ee18_int8_max_modelopt_from_onnx_fp16_cuda_bev.onnx")
-    bev_dec = Path("0kc5po4ee18_int8_max_modelopt_from_onnx_fp16_cuda_bevdec.onnx")
+    enc = Path("models/0kc5po4ee18_int8_smoothquant_onnx_cuda_enc_1000.onnx")
+    msg = Path("models/0kc5po4ee18_int8_smoothquant_onnx_cuda_msg_1000.onnx")
+    post = Path("models/0kc5po4ee18_float32_jit_cuda_post.ts")
+    bev = Path("models/0kc5po4ee18_int8_smoothquant_onnx_cuda_bev_1000.onnx")
+    bev_dec = Path("models/0kc5po4ee18_int8_smoothquant_onnx_cuda_bevdec_1000.onnx")
 
     return dict(enc=enc, msg=msg, post=post, bev=bev, bev_dec=bev_dec)
 

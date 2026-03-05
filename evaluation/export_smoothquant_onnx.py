@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from typing import Dict, List, Optional
-
+import copy
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
@@ -255,10 +255,10 @@ def main():
     # Replace these with your actual calib npz paths
     CALIB_DIR = "./calib"
     calib_paths = {
-        "enc": os.path.join(CALIB_DIR, "calib_encoder_inputs.npz"),
-        "msg": os.path.join(CALIB_DIR, "calib_message_inputs.npz"),
-        "bev": os.path.join(CALIB_DIR, "calib_bev_inputs.npz"),
-        "bev_dec": os.path.join(CALIB_DIR, "calib_bevdecoder_inputs.npz"),
+        "enc": os.path.join(CALIB_DIR, "calib_encoder_inputs_512.npz"),
+        "msg": os.path.join(CALIB_DIR, "calib_message_inputs_512.npz"),
+        "bev": os.path.join(CALIB_DIR, "calib_bev_inputs_512.npz"),
+        "bev_dec": os.path.join(CALIB_DIR, "calib_bevdecoder_inputs_512.npz"),
         # "post": os.path.join(CALIB_DIR, "calib_post_inputs.npz"),  # optional
     }
 
@@ -266,7 +266,11 @@ def main():
     out_dir.mkdir(exist_ok=True)
 
     # Quantization config
-    config = mtq.INT8_SMOOTHQUANT_CFG
+    config = copy.deepcopy(mtq.INT8_SMOOTHQUANT_CFG)
+
+    # Disable *all* quantizers whose module name contains "patch_embed"
+    # (covers both weight_quantizer + input_quantizer under patch_embed.*)
+    config["quant_cfg"]["*patch_embed*"] = {"enable": False}
 
     # --------------------
     # Load modules
@@ -292,25 +296,25 @@ def main():
     )
 
     # Message: x_i, x_j
-    # msg_loader = make_calib_loader(
-    #     calib_paths["msg"],
-    #     keys=["x_i", "x_j"],
-    #     batch_size=8,
-    # )
+    msg_loader = make_calib_loader(
+        calib_paths["msg"],
+        keys=["x_i", "x_j"],
+        batch_size=8,
+    )
 
-    # # Bev: x_i, x_j, edge_pred
-    # bev_loader = make_calib_loader(
-    #     calib_paths["bev"],
-    #     keys=["x_i", "x_j", "edge_preds"],
-    #     batch_size=8,
-    # )
+    # Bev: x_i, x_j, edge_pred
+    bev_loader = make_calib_loader(
+        calib_paths["bev"],
+        keys=["x_i", "x_j", "edge_preds"],
+        batch_size=8,
+    )
 
-    # # Bev decoder: bev_features (or whatever key you used)
-    # bev_dec_loader = make_calib_loader(
-    #     calib_paths["bev_dec"],
-    #     keys=["bev_feats"],  # or ["bev_features"]
-    #     batch_size=8,
-    # )
+    # Bev decoder: bev_features (or whatever key you used)
+    bev_dec_loader = make_calib_loader(
+        calib_paths["bev_dec"],
+        keys=["bev_feats"],  # or ["bev_features"]
+        batch_size=8,
+    )
 
     # --------------------
     # SmoothQuant + INT8 per module
@@ -318,23 +322,24 @@ def main():
     print("\n=== Quantizing encoder with SmoothQuant INT8 ===")
     
     enc_forward_loop = make_forward_loop_encoder(enc_loader, dev)
+    
     encoder_int8 = mtq.quantize(encoder, config, enc_forward_loop)
     mtq.print_quant_summary(encoder_int8)
 
-    # print("\n=== Quantizing message GNN with SmoothQuant INT8 ===")
-    # msg_forward_loop = make_forward_loop_message(msg_loader, dev)
-    # message_int8 = mtq.quantize(message, config, msg_forward_loop)
-    # mtq.print_quant_summary(message_int8)
+    print("\n=== Quantizing message GNN with SmoothQuant INT8 ===")
+    msg_forward_loop = make_forward_loop_message(msg_loader, dev)
+    message_int8 = mtq.quantize(message, config, msg_forward_loop)
+    mtq.print_quant_summary(message_int8)
 
-    # print("\n=== Quantizing bev GNN with SmoothQuant INT8 ===")
-    # bev_forward_loop = make_forward_loop_bev(bev_loader, dev)
-    # bev_int8 = mtq.quantize(bev, config, bev_forward_loop)
-    # mtq.print_quant_summary(bev_int8)
+    print("\n=== Quantizing bev GNN with SmoothQuant INT8 ===")
+    bev_forward_loop = make_forward_loop_bev(bev_loader, dev)
+    bev_int8 = mtq.quantize(bev, config, bev_forward_loop)
+    mtq.print_quant_summary(bev_int8)
 
-    # print("\n=== Quantizing bev decoder with SmoothQuant INT8 ===")
-    # bev_dec_forward_loop = make_forward_loop_bev_dec(bev_dec_loader, dev)
-    # bev_dec_int8 = mtq.quantize(bev_dec, config, bev_dec_forward_loop)
-    # mtq.print_quant_summary(bev_dec_int8)
+    print("\n=== Quantizing bev decoder with SmoothQuant INT8 ===")
+    bev_dec_forward_loop = make_forward_loop_bev_dec(bev_dec_loader, dev)
+    bev_dec_int8 = mtq.quantize(bev_dec, config, bev_dec_forward_loop)
+    mtq.print_quant_summary(bev_dec_int8)
 
     # --------------------
     # Example inputs for ONNX export (match your earlier export script)
@@ -359,7 +364,7 @@ def main():
     export_to_onnx(
         encoder_int8,
         enc_example,
-        out_dir / "0kc5po4ee18_int8_smoothquant_onnx_cuda_enc_trimmed.onnx",
+        out_dir / "0kc5po4ee18_int8_smoothquant_onnx_cuda_enc_512.onnx",
         input_names=["image"],
         output_names=["features"],
         dynamic_axes={
@@ -369,46 +374,46 @@ def main():
     )
 
     # Message GNN
-    # export_to_onnx(
-    #     message_int8,
-    #     (x_i_example, x_j_example),
-    #     out_dir / "0kc5po4ee18_int8_smoothquant_onnx_cuda_msg.onnx",
-    #     input_names=["features_i", "features_j"],
-    #     output_names=["edge_predictions"],
-    #     dynamic_axes={
-    #         "features_i": {0: "batch_size"},
-    #         "features_j": {0: "batch_size"},
-    #         "edge_predictions": {0: "batch_size"},
-    #     },
-    # )
+    export_to_onnx(
+        message_int8,
+        (x_i_example, x_j_example),
+        out_dir / "0kc5po4ee18_int8_smoothquant_onnx_cuda_msg_512.onnx",
+        input_names=["features_i", "features_j"],
+        output_names=["edge_predictions"],
+        dynamic_axes={
+            "features_i": {0: "batch_size"},
+            "features_j": {0: "batch_size"},
+            "edge_predictions": {0: "batch_size"},
+        },
+    )
 
-    # # Bev GNN
-    # export_to_onnx(
-    #     bev_int8,
-    #     (x_i_example, x_j_example, edge_pred_example),
-    #     out_dir / "0kc5po4ee18_int8_smoothquant_onnx_cuda_bev.onnx",
-    #     input_names=["features_i", "features_j", "edge_prediction"],
-    #     output_names=["bev_features"],
-    #     dynamic_axes={
-    #         "features_i": {0: "batch_size"},
-    #         "features_j": {0: "batch_size"},
-    #         "edge_prediction": {0: "batch_size"},
-    #         "bev_features": {0: "batch_size"},
-    #     },
-    # )
+    # Bev GNN
+    export_to_onnx(
+        bev_int8,
+        (x_i_example, x_j_example, edge_pred_example),
+        out_dir / "0kc5po4ee18_int8_smoothquant_onnx_cuda_bev_512.onnx",
+        input_names=["features_i", "features_j", "edge_prediction"],
+        output_names=["bev_features"],
+        dynamic_axes={
+            "features_i": {0: "batch_size"},
+            "features_j": {0: "batch_size"},
+            "edge_prediction": {0: "batch_size"},
+            "bev_features": {0: "batch_size"},
+        },
+    )
 
-    # # Bev decoder
-    # export_to_onnx(
-    #     bev_dec_int8,
-    #     bev_features_example,
-    #     out_dir / "0kc5po4ee18_int8_smoothquant_onnx_cuda_bevdec.onnx",
-    #     input_names=["bev_features"],
-    #     output_names=["bev_map"],
-    #     dynamic_axes={
-    #         "bev_features": {0: "batch_size"},
-    #         "bev_map": {0: "batch_size"},
-    #     },
-    # )
+    # Bev decoder
+    export_to_onnx(
+        bev_dec_int8,
+        bev_features_example,
+        out_dir / "0kc5po4ee18_int8_smoothquant_onnx_cuda_bevdec_512.onnx",
+        input_names=["bev_features"],
+        output_names=["bev_map"],
+        dynamic_axes={
+            "bev_features": {0: "batch_size"},
+            "bev_map": {0: "batch_size"},
+        },
+    )
 
     print("\n✅ SmoothQuant + ONNX export completed.")
 

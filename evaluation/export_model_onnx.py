@@ -155,7 +155,7 @@ class Message(torch.nn.Module):
             PyramidTransformer(
                 linspace_mult(self.in_channels, self.out_channels, 8, 48),
                 [seq_len * 2] * 4 + linspace_mult(seq_len * 2, 8, 4, 8),
-                attn_cls=attn,
+                attn_cls=attn, 
             ),
         )
 
@@ -394,17 +394,17 @@ def convert(model_in_file, data, edge_index, model_out_edges,
     print("\n--- Saving TorchScript Models ---")
     ts_paths = {
         "enc": out_base_dir / f"{model_prefix}_{type_prefix}_jit_{device_str}_enc.ts",
-        "msg": out_base_dir / f"{model_prefix}_{type_prefix}_jit_{device_str}_msg.ts",
+        "msg": out_base_dir / f"{model_prefix}_{type_prefix}_jit_{device_str}_msg_attn.ts",
         "post": out_base_dir / f"{model_prefix}_float32_jit_{device_str}_post.ts",
         "bev": out_base_dir / f"{model_prefix}_{type_prefix}_jit_{device_str}_bev.ts",
         "bev_dec": out_base_dir / f"{model_prefix}_{type_prefix}_jit_{device_str}_bevdec.ts",
     }
     
-    torch.jit.save(traced_models['enc'], ts_paths["enc"])
+    # torch.jit.save(traced_models['enc'], ts_paths["enc"])
     torch.jit.save(traced_models['msg'], ts_paths["msg"])
-    torch.jit.save(traced_models['post'], ts_paths["post"])
-    torch.jit.save(traced_models['bev'], ts_paths["bev"])
-    torch.jit.save(traced_models['bev_dec'], ts_paths["bev_dec"])
+    # torch.jit.save(traced_models['post'], ts_paths["post"])
+    # torch.jit.save(traced_models['bev'], ts_paths["bev"])
+    # torch.jit.save(traced_models['bev_dec'], ts_paths["bev_dec"])
     
     print(f"Saved traced models to '{out_base_dir}':")
     for name, path in ts_paths.items():
@@ -432,26 +432,26 @@ def convert(model_in_file, data, edge_index, model_out_edges,
     }
 
     # Export each model component to ONNX
-    export_to_onnx(
-        models_to_export['enc'], example_inputs['enc'], onnx_paths['enc'],
-        input_names=['image'], output_names=['features'],
-        dynamic_axes={'image': {0: 'batch_size'}, 'features': {0: 'batch_size'}}
-    )
+    # export_to_onnx(
+    #     models_to_export['enc'], example_inputs['enc'], onnx_paths['enc'],
+    #     input_names=['image'], output_names=['features'],
+    #     dynamic_axes={'image': {0: 'batch_size'}, 'features': {0: 'batch_size'}}
+    # )
     export_to_onnx(
         models_to_export['msg'], example_inputs['msg'], onnx_paths['msg'],
         input_names=['features_i', 'features_j'], output_names=['edge_predictions'],
         dynamic_axes={'features_i': {0: 'batch_size'}, 'features_j': {0: 'batch_size'}, 'edge_predictions': {0: 'batch_size'}}
     )
-    export_to_onnx(
-        models_to_export['bev'], example_inputs['bev'], onnx_paths['bev'],
-        input_names=['features_i', 'features_j', 'edge_prediction'], output_names=['bev_features'],
-        dynamic_axes={'features_i': {0: 'batch_size'}, 'features_j': {0: 'batch_size'}, 'edge_prediction': {0: 'batch_size'}, 'bev_features': {0: 'batch_size'}}
-    )
-    export_to_onnx(
-        models_to_export['bev_dec'], example_inputs['bev_dec'], onnx_paths['bev_dec'],
-        input_names=['bev_features'], output_names=['bev_map'],
-        dynamic_axes={'bev_features': {0: 'batch_size'}, 'bev_map': {0: 'batch_size'}}
-    )
+    # export_to_onnx(
+    #     models_to_export['bev'], example_inputs['bev'], onnx_paths['bev'],
+    #     input_names=['features_i', 'features_j', 'edge_prediction'], output_names=['bev_features'],
+    #     dynamic_axes={'features_i': {0: 'batch_size'}, 'features_j': {0: 'batch_size'}, 'edge_prediction': {0: 'batch_size'}, 'bev_features': {0: 'batch_size'}}
+    # )
+    # export_to_onnx(
+    #     models_to_export['bev_dec'], example_inputs['bev_dec'], onnx_paths['bev_dec'],
+    #     input_names=['bev_features'], output_names=['bev_map'],
+    #     dynamic_axes={'bev_features': {0: 'batch_size'}, 'bev_map': {0: 'batch_size'}}
+    # )
 
 
 if __name__ == "__main__":
@@ -506,6 +506,7 @@ if __name__ == "__main__":
     message.pos_embedding = model.model.pose_gnn.pos_embedding
     message.aggregator.load_state_dict(model.model.pose_gnn.aggregator.state_dict())
     message.gnn_decoder_post.load_state_dict(model.model.pose_gnn_decoder_post.state_dict())
+    
 
     bev = Bev(gnn_in_channels, gnn_out_channels, gnn_in_seq_len).eval().to(dev)
     bev.pos_embedding = model.model.bev_gnn.pos_embedding
@@ -543,4 +544,3 @@ if __name__ == "__main__":
     # --- 4. Run Conversion for Different Precisions ---
     convert(model_in_file, data, edge_index, model_out_edges,
             encoder, message, post, bev, bev_dec, device_str, dtype=dtype)
-

@@ -8,7 +8,7 @@ from pathlib import Path
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 # Save module-wise npy
-from evaluation.export_model_torchscript_ori import (
+from evaluation.export_model_torchscript import (
     LoadedModel, Encoder, Message, PosePost, Bev, BevDecoder
 )
 
@@ -77,9 +77,9 @@ out_dir = Path("./calib")
 out_dir.mkdir(parents=True, exist_ok=True)
 
 # How many samples to collect per module (change if you want more/less)
-MAX_ENC   = 1000    # 1000 # number of images for Encoder
-MAX_EDGES = 1000   # 1000 # number of edges (pairs) for Message / PosePost / Bev
-MAX_BEV   = 1000    # 1000 # number of bev feature tensors for BevDecoder
+MAX_ENC   = 512    # 1000 # number of images for Encoder
+MAX_EDGES = 512   # 1000 # number of edges (pairs) for Message / PosePost / Bev
+MAX_BEV   = 512    # 1000 # number of bev feature tensors for BevDecoder
 
 # ---------- collectors ----------
 enc_imgs   = []
@@ -97,6 +97,7 @@ eval_meta = defaultdict(list)
 # ---------- dataloader ----------
 # Expect an existing `dataloader` object (RelPosDataModule) in your env.
 # If you already have: train_set = dataloader.train_dataloader(), just reuse it.
+print("Setting up dataloader ...")
 from train.dataloader import RelPosDataModule
 import yaml
 with open('./train/configs/covisnet.yaml', 'r') as file:
@@ -104,8 +105,8 @@ with open('./train/configs/covisnet.yaml', 'r') as file:
     
 dataloader = RelPosDataModule(**config["data"])
 dataloader.setup(stage=None)
-train_loader = dataloader.val_dataloader()
-
+train_loader = dataloader.train_dataloader()
+print(train_loader)
 # quick dtype consistency (match your chosen dtype above)
 RUN_DTYPE =  torch.float32 # from your model code (fp16 by default)
 
@@ -118,7 +119,7 @@ full_model.eval()
 encoder.eval(); message.eval(); post.eval(); bev.eval(); bev_dec.eval()
 
 with torch.no_grad():
-    for batch in iter(train_loader[0]):
+    for batch in iter(train_loader):
         batch = batch[0]
         if enc_count >= MAX_ENC and edge_count >= MAX_EDGES and bev_count >= MAX_BEV:
             break
@@ -254,23 +255,28 @@ def maybe_save_npz(path, **arrays):
     np.savez(path, **npz_payload)
     print(f"Saved: {path}")
 
+print("Saving calibration data ...")	
 # Encoder calibration (images)
-maybe_save_npz(out_dir / "calib_encoder_inputs.npz", imgs=enc_imgs)
+maybe_save_npz(out_dir / "calib_encoder_inputs_512.npz", imgs=enc_imgs)
 
+print(f"Collected {enc_count} encoder images, {edge_count} edges, {bev_count} bev features")
 # Message calibration (two inputs)
-maybe_save_npz(out_dir / "calib_message_inputs.npz", x_i=msg_xi, x_j=msg_xj)
+maybe_save_npz(out_dir / "calib_message_inputs_512.npz", x_i=msg_xi, x_j=msg_xj)
 
+print(f"Collected {len(msg_xi)} message input pairs")
 # PosePost calibration (edge_preds)
-maybe_save_npz(out_dir / "calib_posepost_inputs.npz", edge_preds=post_in)
+maybe_save_npz(out_dir / "calib_posepost_inputs_512.npz", edge_preds=post_in)
 
+print(f"Collected {len(post_in)} PosePost input edge_preds")
 # BEV calibration (x_i, x_j, edge_pred)
-maybe_save_npz(out_dir / "calib_bev_inputs.npz", x_i=bev_xi, x_j=bev_xj, edge_preds=bev_pose)
+maybe_save_npz(out_dir / "calib_bev_inputs_512.npz", x_i=bev_xi, x_j=bev_xj, edge_preds=bev_pose)
 
+print(f"Collected {len(bev_pose)} BEV input sets")
 # BevDecoder calibration (bev features)
-maybe_save_npz(out_dir / "calib_bevdecoder_inputs.npz", bev_feats=bevdec_in)
+maybe_save_npz(out_dir / "calib_bevdecoder_inputs_512.npz", bev_feats=bevdec_in)
 
 # Save eval meta (rest of keys)
-meta_path = out_dir / "eval_meta.pkl"
+meta_path = out_dir / "eval_meta_512.pkl"
 # concat along first dim if tensors; otherwise keep as lists
 for k in list(eval_meta.keys()):
     vs = eval_meta[k]

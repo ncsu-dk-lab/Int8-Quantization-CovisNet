@@ -65,7 +65,6 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
-
 class MemEffAttention(Attention):
     def forward(self, x: Tensor, attn_bias=None) -> Tensor:
         if not XFORMERS_AVAILABLE:
